@@ -8,7 +8,7 @@ jobs:
         os: [ubuntu-22.04]
         clang: [16]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
             # Nix Flakes doesn't work on shallow clones
             fetch-depth: 0
@@ -39,7 +39,7 @@ jobs:
         os: [ubuntu-22.04]
         clang: [8, 10, 11, 12, 16]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
             # Nix Flakes doesn't work on shallow clones
             fetch-depth: 0
@@ -71,7 +71,7 @@ jobs:
         gcc: [10]
         llvm: [8, 10, 11, 12, 16]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v6
         with:
             # Nix Flakes doesn't work on shallow clones
             fetch-depth: 0
