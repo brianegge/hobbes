@@ -103,7 +103,7 @@ jobs:
     permissions:
       contents: read
     container:
-      image: rockylinux:8
+      image: rockylinux:9
     steps:
       - uses: actions/checkout@v6
       - name: Install dependencies
