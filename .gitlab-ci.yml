@@ -57,7 +57,7 @@ build-job-clang11:       # This job runs in the build stage, which runs first.
 
 build-job-rhel9:       # This job builds on Red Hat Enterprise Linux 8/9 compatible.
   stage: build
-  image: rockylinux:8
+  image: rockylinux:9
   script:
     - echo "Building on Rocky Linux 8 (RHEL 8 compatible)..."
     - dnf update -y
