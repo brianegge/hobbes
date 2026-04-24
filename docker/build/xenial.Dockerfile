@@ -1,4 +1,4 @@
-FROM ubuntu:noble
+FROM ubuntu:resolute
 ARG  DEPS
 ENV  ARGS -V
 RUN  apt update
