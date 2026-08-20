@@ -68,6 +68,71 @@ TEST(TypeInf, DecodeRejectsTruncatedInput) {
   EXPECT_TRUE(threw);
 }
 
+TEST(TypeInf, RecordLayoutRejectsUnrepresentableSizes) {
+  // A type description can be read from a file or handed over by an untrusted
+  // peer, and nothing in it is bounded by what a value in memory could be. The
+  // size of a type is computed as an 'unsigned int' and a record member offset
+  // is held in an 'int' (with -1 reserved for 'not yet determined'), so a
+  // fixed array long enough to run past those used to be multiplied and summed
+  // through signed overflow -- undefined behavior -- into a wrapped-around
+  // layout. Such a type has no representation here and must be rejected.
+  const MonoTypePtr huge(FixedArray::make(primty("long"), MonoTypePtr(TLong::make(std::numeric_limits<long>::max()))));
+
+  // sizing the array on its own is rejected: this is the multiplication that
+  // overflowed, 8 bytes an element by a length only the encoding bounds
+  EXPECT_EXCEPTION(sizeOf(huge));
+
+  // a length that multiplies out without overflowing, but still to a size no
+  // value can have, is out of range just the same
+  EXPECT_EXCEPTION(sizeOf(MonoTypePtr(FixedArray::make(primty("char"), MonoTypePtr(TLong::make(0x100000000L))))));
+
+  // as is any record laid out over it
+  EXPECT_EXCEPTION(Record::make(list(Record::Member("a", huge))));
+
+  // a negative length describes no array at all
+  EXPECT_EXCEPTION(sizeOf(MonoTypePtr(FixedArray::make(primty("char"), MonoTypePtr(TLong::make(-1))))));
+
+  // members that each fit but together run past the end of the layout are
+  // rejected too -- here it is the running offset that goes out of range
+  const MonoTypePtr big(FixedArray::make(primty("char"), MonoTypePtr(TLong::make(0x40000000))));
+  Record::Members ms;
+  for (size_t i = 0; i < 4; ++i) {
+    ms.push_back(Record::Member(".f" + str::from(i), big));
+  }
+  EXPECT_EXCEPTION(Record::make(ms));
+
+  // and the same record arriving as an encoded type description -- which is
+  // what the binary decoder consumes -- is rejected rather than crashing it
+  std::vector<unsigned char> enc;
+  auto put = [&](const void* p, size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    enc.insert(enc.end(), b, b + n);
+  };
+  const int          tcode  = Record::type_case_id;
+  const size_t       nmems  = 1;
+  const size_t       namesz = 1;
+  const unsigned int offset = static_cast<unsigned int>(-1); // 'determine this offset'
+  put(&tcode,  sizeof(tcode));
+  put(&nmems,  sizeof(nmems));
+  put(&namesz, sizeof(namesz));
+  put("a", 1);
+  put(&offset, sizeof(offset));
+  encode(huge, &enc);
+
+  bool threw = false;
+  try { decode(enc); } catch (const std::exception&) { threw = true; }
+  EXPECT_TRUE(threw);
+
+  // ordinary records are laid out as before
+  const MonoTypePtr rty =
+    Record::make(list(Record::Member("a", primty("char")), Record::Member("b", primty("long"))));
+  EXPECT_EQ(sizeOf(rty), 16U);
+
+  const Record* rec = is<Record>(rty);
+  EXPECT_TRUE(rec != nullptr);
+  EXPECT_EQ(rec->alignedMembers().size(), size_t(3)); // 'a', 7 bytes of padding, 'b'
+}
+
 TEST(TypeInf, CodecRejectsInvalidBoolValue) {
   // the stream codec decodes data that can arrive from an untrusted peer;
   // loading any byte other than 0 or 1 into a bool is undefined behavior, so
