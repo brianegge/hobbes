@@ -11,6 +11,7 @@
 #include <hobbes/util/codec.H>
 #include <hobbes/util/perf.H>
 #include <hobbes/util/str.H>
+#include <limits>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -1163,19 +1164,33 @@ MonoTypePtr Record::tailType() const {
 Record::Members Record::withResolvedMemoryLayout(const Members& ms) {
   Members r;
 
+  const auto layoutOverflow = [&ms](const std::string& what) {
+    return std::runtime_error(
+      "Record layout exceeds the maximum representable " + what + ": " + showRecord(ms));
+  };
+
   // infer offsets and/or insert padding as necessary
-  int o = 0;
+  //
+  // member sizes come from decoded type descriptions, whose array lengths an
+  // untrusted peer may have chosen, so the running offset is accumulated in a
+  // wider type than it is stored in and checked at each step: a record that
+  // runs past what an offset ('int') or a size ('unsigned int') can hold has no
+  // layout to describe, and computing one wrapped it into a nonsensical one
+  long o = 0;
   for (auto m = ms.begin(); m != ms.end(); ++m) {
     if (!isMonoSingular(m->type)) {
       return ms;
     }
 
-    o = align<unsigned int>(o, alignment(m->type));
+    o = align<long>(o, static_cast<long>(alignment(m->type)));
+    if (o > std::numeric_limits<int>::max()) {
+      throw layoutOverflow("member offset");
+    }
 
     // determine the 'in-memory' layout of this structure
     //   (must be consistent with GCC so that we can interoperate)
     if (m->offset == -1) {
-      r.push_back(addoffset(*m, o));
+      r.push_back(addoffset(*m, static_cast<int>(o)));
     } else if (m->offset > o) {
       throw
         std::runtime_error(
@@ -1196,6 +1211,9 @@ Record::Members Record::withResolvedMemoryLayout(const Members& ms) {
     }
 
     o += sizeOf(m->type);
+    if (o > std::numeric_limits<unsigned int>::max()) {
+      throw layoutOverflow("size");
+    }
   }
 
   return r;
@@ -2126,7 +2144,23 @@ public:
   nat with(const OpaquePtr*  v) const override { return v->storedContiguously() ? v->size() : sizeof(void*); }
   [[noreturn]] nat with(const TVar*       v) const override { throw std::runtime_error("Can't determine size of type variable '" + v->name() + "'"); }
   [[noreturn]] nat with(const TGen*       v) const override { throw std::runtime_error("Can't determine size of polytype argument #" + str::from(v->id())); }
-  nat with(const FixedArray* v) const override { return r(v->type()) * v->requireLength(); }
+  nat with(const FixedArray* v) const override {
+    const long len = v->requireLength();
+    if (len < 0) {
+      throw std::runtime_error("Can't determine size of array with negative length: " + show(v));
+    }
+
+    // memory sizes are held as 'nat', so an array whose byte count doesn't fit
+    // there has no layout we could describe; multiplying it out first would
+    // overflow rather than produce that size (the length arrives from decoded
+    // type descriptions, so it can be any long an untrusted peer chose)
+    const auto esz = static_cast<unsigned long>(r(v->type()));
+    const auto n   = static_cast<unsigned long>(len);
+    if (n != 0 && esz > (std::numeric_limits<nat>::max() / n)) {
+      throw std::runtime_error("Size of array exceeds the maximum representable type size: " + show(v));
+    }
+    return static_cast<nat>(esz * n);
+  }
   nat with(const Array*       ) const override { return sizeof(void*); }
   nat with(const Variant*    v) const override { return rv(v); }
   nat with(const Record*     v) const override { return rv(v); }

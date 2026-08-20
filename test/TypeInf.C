@@ -68,6 +68,62 @@ TEST(TypeInf, DecodeRejectsTruncatedInput) {
   EXPECT_TRUE(threw);
 }
 
+TEST(TypeInf, SizeOfRejectsUnrepresentableSizes) {
+  // sizes are computed over decoded type descriptions, so an array length or a
+  // record layout can be anything an untrusted peer wrote down; one that has no
+  // representable size must be rejected rather than multiplied or accumulated
+  // out of range (the array case overflowed a signed multiply, and the record
+  // case wrapped its running offset into a negative one)
+  const long huge = 1L << 61;
+
+  EXPECT_EXCEPTION(sizeOf(FixedArray::make(primty("int"), tlong(huge))));
+  EXPECT_EXCEPTION(sizeOf(FixedArray::make(primty("int"), tlong(-1))));
+  EXPECT_EXCEPTION(
+    Record::make(list(
+      Record::Member("a", arrayty(primty("char"), 2000000000)),
+      Record::Member("b", arrayty(primty("char"), 2000000000)),
+      Record::Member("c", arrayty(primty("char"), 2000000000))
+    ))
+  );
+
+  // sizes that do fit are unaffected, including an empty array of a huge type
+  EXPECT_EQ(sizeOf(arrayty(primty("int"), 4)), 16u);
+  EXPECT_EQ(sizeOf(FixedArray::make(arrayty(primty("char"), 2000000000), tlong(0))), 0u);
+  EXPECT_EQ(sizeOf(tuplety(list(primty("char"), primty("int")))), 8u);
+}
+
+TEST(TypeInf, DecodeRejectsUnrepresentableArraySize) {
+  // the same limit over the wire: a record naming an array of 2^61 ints, whose
+  // member size is computed while the record's memory layout is resolved
+  std::vector<unsigned char> member;
+  encode(FixedArray::make(primty("int"), tlong(1L << 61)), &member);
+
+  std::vector<unsigned char> enc;
+  auto put = [&enc](const void* p, size_t n) {
+    const auto* b = static_cast<const unsigned char*>(p);
+    enc.insert(enc.end(), b, b + n);
+  };
+  const int          rtag   = Record::type_case_id;
+  const size_t       count  = 1;
+  const size_t       fnlen  = 1;
+  const unsigned int offset = 0;
+  put(&rtag, sizeof(rtag));
+  put(&count, sizeof(count));
+  put(&fnlen, sizeof(fnlen));
+  put("x", 1);
+  put(&offset, sizeof(offset));
+  enc.insert(enc.end(), member.begin(), member.end());
+
+  bool threw = false;
+  try { decode(enc); } catch (const std::exception&) { threw = true; }
+  EXPECT_TRUE(threw);
+
+  // the same record with a length that fits still decodes
+  std::vector<unsigned char> ok;
+  encode(Record::make(list(Record::Member("x", arrayty(primty("int"), 4), 0))), &ok);
+  EXPECT_TRUE(sizeOf(decode(ok)) == 16u);
+}
+
 TEST(TypeInf, CodecRejectsInvalidBoolValue) {
   // the stream codec decodes data that can arrive from an untrusted peer;
   // loading any byte other than 0 or 1 into a bool is undefined behavior, so
