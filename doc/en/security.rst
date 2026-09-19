@@ -32,6 +32,19 @@ text (lexing and parsing, before anything is compiled or evaluated) must be
 safe on arbitrary bytes. A crash or memory error in the lexer/parser on
 malformed input is a defect.
 
+Type-checking is on the far side of the boundary, not the near one: some
+type-class constraint resolutions run native code as a side effect of
+*inference* (deciding whether an expression type-checks), before there is
+any decision to evaluate it. ``LoadFile``'s constraint used to pass a path
+straight to ``wordexp()`` with command substitution enabled, so type-checking
+alone — a ``:t`` in the REPL, a ``typeof`` call, an application that only
+validates a user's expression without ever running it — executed a
+``$(...)``/`````...````` embedded in the path via a spawned shell
+(STRFR-433916). ``expandPath`` (``lib/hobbes/util/str.C``) now passes
+``WRDE_NOCMD``, but the general implication stands: treat *type-checking*
+untrusted Hobbes source with the same suspicion as evaluating it, not with
+the parser's "must be safe on arbitrary bytes" standard.
+
 Being safe on arbitrary bytes includes not being asked for unbounded work.
 A regex literal is read into a tree that the parser, the NFA translation, and
 the tree's own destructor each walk recursively, so a regex literal is bounded
@@ -94,6 +107,7 @@ Summary table
 Input                                            Trust assumption
 ===============================================  ==========================================
 Hobbes source (compiled and evaluated)           Trusted — equivalent to native code
+Hobbes source (type-checked, even if not run)    Trusted — inference can run native code
 Hobbes source (lexed/parsed only)                Untrusted — parser must be safe
 RPC peers (post-handshake semantics)             Trusted — peers execute code by design
 RPC wire bytes (framing, type descriptions)      Untrusted — decoder must be safe
