@@ -70,8 +70,8 @@ security reports.
 --------------------------------------------------------------------
 
 Peers on a trusted network are expected to execute code by design (above),
-but ``hi``'s ``pexec``/``writefile``/``removefile``/``openfd``/``readfile``
-(``bin/hi/funcdefs.C``) and ``linkTarget``/``slurpFile`` (``bin/hi/www.C``)
+but ``hi``'s ``pexec``/``writefile``/``removefile``/``openfd``/``readfile``/
+``fdReadLine`` (``bin/hi/funcdefs.C``) and ``linkTarget``/``slurpFile`` (``bin/hi/www.C``)
 raise the stakes of that design past "arbitrary code" to "arbitrary process
 execution and unrestricted file read/write/delete" — meant, per their own
 comment, for "local evaluations", not for whatever reaches ``hi -p`` or
@@ -115,7 +115,7 @@ RPC wire bytes (framing, type descriptions)      Untrusted — decoder must be s
 Structured data files (fregion / hog logs)       Trusted writers — reader must still
                                                  reject malformed images safely
 hi's pexec/writefile/removefile/openfd/          Denied under 'option Safe' (default) —
-readfile/linkTarget/slurpFile                    opt out explicitly with -o no-Safe
+readfile/fdReadLine/linkTarget/slurpFile         opt out explicitly with -o no-Safe
 ===============================================  ==========================================
 
 Guidance for embedding applications
@@ -127,8 +127,9 @@ Guidance for embedding applications
   encrypted transports if they must cross anything else.
 * Don't pass ``-o no-Safe`` to a ``hi`` instance that also runs ``-p`` or
   ``-w``: it restores ``pexec``/``writefile``/``removefile``/``openfd``/
-  ``readfile``/``linkTarget``/``slurpFile`` for every expression the listener
-  accepts, network-wide process execution and file access included.
+  ``readfile``/``fdReadLine``/``linkTarget``/``slurpFile`` for every
+  expression the listener accepts, network-wide process execution and file
+  access included.
 * Restrict write access to structured data files to the processes that are
   supposed to produce them.
 * Know the memory model before pointing analysis tooling at an embedding
