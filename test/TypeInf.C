@@ -584,6 +584,120 @@ TEST(TypeInf, TypeApplicationReductionIsBounded) {
   EXPECT_TRUE(show(repType(TApp::make(ident, list(primty("int"))))) == "int");
 }
 
+TEST(TypeInf, TypeApplicationRespectsTheBindersOfTypeFunctions) {
+  // '\x.(x -> \x.x)' applied to int is 'int -> \x.x': the inner binder shadows the
+  // outer one, so the substitution for the outer 'x' stops there
+  MonoTypePtr inner = TAbs::make(str::strings("x"), tvar("x"));
+  MonoTypePtr k     = Prim::make("k", TAbs::make(str::strings("x"), functy(tvar("x"), inner)));
+  EXPECT_TRUE(repType(TApp::make(k, list(primty("int")))) == functy(primty("int"), inner));
+
+  // a binder only shadows its own name
+  MonoTypePtr j = Prim::make("j", TAbs::make(str::strings("x"), functy(tvar("x"), TAbs::make(str::strings("y"), functy(tvar("x"), tvar("y"))))));
+  EXPECT_TRUE(repType(TApp::make(j, list(primty("int")))) == functy(primty("int"), TAbs::make(str::strings("y"), functy(primty("int"), tvar("y")))));
+}
+
+TEST(TypeInf, TypeApplicationReductionIsBoundedInWork) {
+  // OSS-Fuzz 574069291: a decoded record with one field, of the type
+  //
+  //   w (\x. x (w (\x. x (x v))))      where w = \x. x x
+  //
+  // Each binder shadows the last, and substitution used to reach through them, which
+  // made the term grow doubly exponentially per reduction step. Being interned, it
+  // stays a few dozen distinct nodes, so the step budget never came close to firing
+  // before a single substitution was walking tens of millions of nodes. Respecting
+  // the binders, it is done in a few dozen steps.
+  auto omega = [](const std::string& n) {
+    return MonoTypePtr(
+      Prim::make(n, TAbs::make(str::strings("x"), TApp::make(tvar("x"), list(MonoTypePtr(tvar("x")))))));
+  };
+  auto lam = [](const MonoTypePtr& b) { return TAbs::make(str::strings("x"), b); };
+  auto app = [](const MonoTypePtr& f, const MonoTypePtr& a) { return TApp::make(f, list(a)); };
+  MonoTypePtr x = tvar("x");
+  MonoTypePtr t = app(omega("p"), lam(app(x, app(omega("q"), lam(app(x, app(x, tvar("v"))))))));
+
+  auto t0 = std::chrono::steady_clock::now();
+  try {
+    Record::make(list(Record::Member("f", t, 0)));
+  } catch (std::exception&) {
+    // a type variable is left in the field, and has no layout
+  }
+  EXPECT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+
+  // Respecting binders is not enough to bound the work. Here each step passes on a
+  // type twice the size of the one it was handed, in continuation-passing style:
+  //
+  //   dbl int (\a0. dbl a0 (\a1. dbl a1 (... (\an. an))))   where dbl = \x k. k (x -> x)
+  //
+  // which reaches a normal form in a few steps per level -- a function type 2^n
+  // nodes in size, but of n distinct nodes. The size is what substitution walks
+  // (and what laying it out or showing it would walk after), so this is rejected
+  // for the work it would take, well before the step budget would reject it.
+  MonoTypePtr dbl = Prim::make("dbl", TAbs::make(str::strings("x", "k"), app(tvar("k"), functy(tvar("x"), tvar("x")))));
+  auto doublings = [&](size_t levels, const MonoTypePtr& base) {
+    MonoTypePtr k = TAbs::make(str::strings("a" + str::from(levels)), tvar("a" + str::from(levels)));
+    for (size_t i = levels; i > 0; --i) {
+      std::string a = "a" + str::from(i - 1);
+      k = TAbs::make(str::strings(a), TApp::make(dbl, list(MonoTypePtr(tvar(a)), k)));
+    }
+    return TApp::make(dbl, list(base, k));
+  };
+  MonoTypePtr doubling = doublings(64, primty("int"));
+
+  t0 = std::chrono::steady_clock::now();
+  EXPECT_EXCEPTION(repType(doubling));
+  EXPECT_EXCEPTION(Record::make(list(Record::Member("f", doubling, 0))));
+  EXPECT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+
+  // while a few levels of the same reduce, to a normal form of the expected size
+  MonoTypePtr i2 = functy(primty("int"), primty("int"));
+  MonoTypePtr i4 = functy(i2, i2);
+  EXPECT_TRUE(repType(doublings(2, primty("int"))) == functy(i4, i4));
+
+  // The budget is for all of the reductions that decoding one description makes. Each
+  // field of this record reduces within it on its own, but a peer could send a record
+  // with as many of them as it likes.
+  auto recordOf = [](const MonoTypes& fields) {
+    // encoded by hand: building the record would reduce (and memoize) its fields, each
+    // of which reduces to a function type, which is laid out as a pointer
+    std::vector<unsigned char> out;
+    auto put = [&](const void* p, size_t n) { out.insert(out.end(), static_cast<const unsigned char*>(p), static_cast<const unsigned char*>(p) + n); };
+    int cid = Record::type_case_id;
+    size_t n = fields.size();
+    put(&cid, sizeof(cid));
+    put(&n, sizeof(n));
+    for (size_t i = 0; i < fields.size(); ++i) {
+      std::string f = "f" + str::from(i);
+      size_t fn = f.size();
+      unsigned int offset = static_cast<unsigned int>(i * sizeof(void*));
+      put(&fn, sizeof(fn));
+      put(f.data(), f.size());
+      put(&offset, sizeof(offset));
+      std::vector<unsigned char> ty;
+      encode(fields[i], &ty);
+      out.insert(out.end(), ty.begin(), ty.end());
+    }
+    return out;
+  };
+  const std::vector<std::string> bases = {"int", "long", "double", "short", "char", "float", "bool", "byte"};
+  MonoTypes fields;
+  for (const auto& b : bases) {
+    fields.push_back(doublings(15, primty(b.c_str())));
+  }
+  EXPECT_TRUE(decode(recordOf(list(fields[0]))) != MonoTypePtr());
+  t0 = std::chrono::steady_clock::now();
+  EXPECT_EXCEPTION(decode(recordOf(fields)));
+  EXPECT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
+
+  // and a reduction that nests deeper than anything laid out afterwards can recur
+  // through is rejected too, rather than left to run out the stack
+  MonoTypePtr deep = tvar("y");
+  for (size_t i = 0; i < 5000; ++i) {
+    deep = arrayty(deep);
+  }
+  MonoTypePtr wrap = Prim::make("wrap", TAbs::make(str::strings("y"), deep));
+  EXPECT_EXCEPTION(repType(TApp::make(wrap, list(primty("int")))));
+}
+
 TEST(TypeInf, RecordLayoutCostsTheTypesSharedSize) {
   // Interning makes a type with two same-typed fields per level a DAG: k
   // levels hold k+1 distinct types, but 2^k paths reach the innermost one.
