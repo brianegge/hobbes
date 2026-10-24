@@ -2104,11 +2104,45 @@ ConstraintPtr substitute(const MonoTypeSubst& s, const ConstraintPtr& p) {
   return p->substitute(s);
 }
 
+// The work that reducing a type to its representation may do (see repType below).
+// A reduction substitutes over the term it reduces at every step, and a type
+// description read from a file or a network peer can make that term grow at every
+// step -- doubly exponentially, for a self-application -- while staying a handful of
+// shared nodes in memory. So substitution is budgeted by the nodes it builds, and by
+// how deeply it nests them (the reduced type is walked recursively afterwards, to lay
+// it out and to show it), for as long as a reduction is under way on this thread.
+//
+// A reduction can start others -- laying out a record that a substitution builds
+// reduces its members' types -- and those draw on the same budget, so that it bounds
+// the whole reduction rather than each piece of it. Substitution outside of a
+// reduction (as in type inference) is not budgeted.
+struct reductionBudget {
+  size_t nodes;
+  size_t depth;
+};
+static const size_t maxReductionNodes = 1000000;
+static const size_t maxReductionDepth = 2000;
+static thread_local reductionBudget* activeReduction = nullptr;
+
 class substituteF : public switchTyFn {
 public:
   substituteF(bool transitive, const MonoTypeSubst& s) : transitive(transitive), s(s) { }
 
+  MonoTypePtr with(const Prim*       v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const OpaquePtr*  v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const TGen*       v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const TApp*       v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const FixedArray* v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const Array*      v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const Variant*    v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const Record*     v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const Func*       v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const TString*    v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const TLong*      v) const override { budgeted b(this); return switchTyFn::with(v); }
+  MonoTypePtr with(const TExpr*      v) const override { budgeted b(this); return switchTyFn::with(v); }
+
   MonoTypePtr with(const TVar* v) const override {
+    budgeted b(this);
     auto si = this->s.find(v->name());
     if (si != this->s.end()) {
       if (this->transitive) {
@@ -2129,7 +2163,31 @@ public:
     }
   }
 
+  // a type function binds its argument names in its body, so there they are not the
+  // variables this substitution replaces -- applying '\x.\x.x' substitutes for the
+  // outer 'x', and must leave the inner one alone
+  MonoTypePtr with(const TAbs* v) const override {
+    budgeted b(this);
+    MonoTypeSubst cuts;
+    bool shadows = false;
+    for (const auto& arg : v->args()) {
+      if (this->s.find(arg) != this->s.end()) {
+        if (!shadows) {
+          cuts = this->s;
+          shadows = true;
+        }
+        cuts.erase(arg);
+      }
+    }
+    if (!shadows) {
+      return TAbs::make(v->args(), switchOf(v->body(), *this));
+    } else {
+      return TAbs::make(v->args(), switchOf(v->body(), substituteF(this->transitive, cuts)));
+    }
+  }
+
   MonoTypePtr with(const Exists* v) const override {
+    budgeted b(this);
     if (this->s.find(v->absTypeName()) == this->s.end()) {
       return Exists::make(v->absTypeName(), switchOf(v->absType(), *this));
     } else {
@@ -2140,6 +2198,7 @@ public:
   }
 
   MonoTypePtr with(const Recursive* v) const override {
+    budgeted b(this);
     if (this->s.find(v->recTypeName()) == this->s.end()) {
       return Recursive::make(v->recTypeName(), switchOf(v->recType(), *this));
     } else {
@@ -2165,6 +2224,33 @@ private:
     const expansion*   next;
   };
   mutable const expansion* expansions = nullptr;
+
+  // each node visited is charged to the reduction under way, if there is one
+  reductionBudget* budget = activeReduction;
+
+  struct budgeted {
+    explicit budgeted(const substituteF* f) : b(f->budget) {
+      if (this->b != nullptr) {
+        if (this->b->nodes == 0) {
+          throw std::runtime_error("Type-level application does not reduce within " + std::to_string(maxReductionNodes) + " type nodes");
+        }
+        if (this->b->depth == maxReductionDepth) {
+          throw std::runtime_error("Type-level application does not reduce within " + std::to_string(maxReductionDepth) + " levels of nesting");
+        }
+        --this->b->nodes;
+        ++this->b->depth;
+      }
+    }
+    ~budgeted() {
+      if (this->b != nullptr) {
+        --this->b->depth;
+      }
+    }
+    budgeted(const budgeted&) = delete;
+    budgeted& operator=(const budgeted&) = delete;
+
+    reductionBudget* b;
+  };
 
   bool expanding(const std::string& n) const {
     for (const expansion* e = this->expansions; e != nullptr; e = e->next) {
@@ -2348,6 +2434,29 @@ static MonoTypePtr repTypeWithin(const MonoTypePtr& ty, size_t* steps) {
   }
 }
 
+// the budget of substitution work for a reduction, which one started while another is
+// under way (reducing the members of a record that the outer one built) shares
+namespace {
+class reductionScope {
+public:
+  reductionScope() : outer(activeReduction) {
+    if (this->outer == nullptr) {
+      activeReduction = &this->budget;
+    }
+  }
+  ~reductionScope() {
+    if (this->outer == nullptr) {
+      activeReduction = nullptr;
+    }
+  }
+  reductionScope(const reductionScope&) = delete;
+  reductionScope& operator=(const reductionScope&) = delete;
+private:
+  reductionBudget  budget{maxReductionNodes, 0};
+  reductionBudget* outer;
+};
+}
+
 // memoized for the same reason alignment() is, and it is the reduction that
 // dominates: laying out a record reduces each member's type, at every level of
 // a nested description, and each of those reductions substitutes over the term
@@ -2361,6 +2470,7 @@ MonoTypePtr repType(const MonoTypePtr& t) {
   if (t->repTypeMemo) {
     return t->repTypeMemo;
   }
+  reductionScope scope;
   size_t steps = maxRepTypeSteps;
   MonoTypePtr r = repTypeWithin(t, &steps);
   if (r.get() != t.get()) {
@@ -3065,6 +3175,10 @@ MonoTypePtr decodeFrom(const bytes& in, unsigned int* n) {
 }
 
 MonoTypePtr decode(const std::vector<unsigned char>& in) {
+  // laying out each record and variant in the description reduces its members' types,
+  // and those reductions share one budget of work (see repType), so that a description
+  // with many members that are each just under the budget is still bounded as a whole
+  reductionScope scope;
   unsigned int n = 0;
   return decodeFrom(in, &n);
 }
