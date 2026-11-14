@@ -1227,8 +1227,10 @@ TEST(TypeInf, ReductionWhoseTermGrowsWithoutEndIsRefused) {
   auto t0 = std::chrono::steady_clock::now();
   try {
     Record::make(list(Record::Member("f", t)));
-  } catch (std::exception&) {
-    // what it reduces to leaves 'y' applied, which has no layout
+  } catch (std::exception& e) {
+    // what it reduces to leaves 'y' applied, which has no layout -- but it must
+    // get there by reducing, not by running out of budget
+    EXPECT_TRUE(std::string(e.what()).find("Type-level reduction visits more than") == std::string::npos);
   }
   EXPECT_TRUE(std::chrono::steady_clock::now() - t0 < std::chrono::seconds(5));
 

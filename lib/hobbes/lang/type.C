@@ -2522,7 +2522,10 @@ static MonoTypePtr repTypeWithin(const MonoTypePtr& ty, size_t* steps) {
 // The memo does not weaken the bound above. A reduction that fails to reach a
 // normal form throws with nothing memoized, and one that reduces to itself is
 // over in one case-check, so only completed reductions to a different type are
-// stored -- and re-serving one of those is what the memo is for.
+// stored -- and re-serving one of those is what the memo is for. The work of one
+// decode is bounded; a decode that runs out of budget may still have memoized
+// the members it reduced before it did, so sending the same description again
+// gets further. Each attempt is still bounded, which is what the budget is for.
 MonoTypePtr repType(const MonoTypePtr& t) {
   if (t->repTypeMemo) {
     return t->repTypeMemo;
