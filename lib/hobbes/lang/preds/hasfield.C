@@ -126,7 +126,19 @@ struct RewriteFnAccess : public switchExprTyFn {
   Definitions*        ds;
   Fields              fields;
 
-  RewriteFnAccess(const HFEliminator& hfe, const TEnvPtr& tenv, Definitions* ds) : hfe(hfe), tenv(tenv), ds(ds) {
+  // Whether each projection made here is handed to the eliminator as it is
+  // made. An eliminator that resolves a field some other way needs that (the
+  // projection is what it rewrites). The record eliminator only takes the
+  // constraint out of the types under the projection, which it is about to do
+  // for the whole expression anyway, and doing it at every use as well copies
+  // what is under each of a chain of them once for each one above it.
+  bool unqualifyAtUse;
+
+  RewriteFnAccess(const HFEliminator& hfe, const TEnvPtr& tenv, Definitions* ds, bool unqualifyAtUse) : hfe(hfe), tenv(tenv), ds(ds), unqualifyAtUse(unqualifyAtUse) {
+  }
+
+  ExprPtr rewritten(const ConstraintPtr& cst, const ExprPtr& e) const {
+    return this->unqualifyAtUse ? this->hfe.unqualify(this->tenv, cst, e, this->ds) : e;
   }
 
   void add(const ConstraintPtr& cst, const HasField& hf) {
@@ -141,11 +153,25 @@ struct RewriteFnAccess : public switchExprTyFn {
   // (an applied use is decided from the application's type and its head's together: type inference gives an
   //  application the constraints of its head, and an annotation those of what it annotates, so the constraints
   //  that a use states can be read from where it is applied)
+  //
+  // (each type is read once: looking in one type for each constraint of the other
+  //  would take time in the product of the two, and each can state hundreds)
   const Fields::value_type* fieldFor(const QualTypePtr& t0, const QualTypePtr& t1) const {
+    std::vector<bool> inT1;
+    if (t1 != t0) {
+      inT1.resize(this->fields.size(), false);
+      for (const auto& c : t1->constraints()) {
+        auto f = this->fields.find(c);
+        if (f != this->fields.end()) {
+          inT1[f->second.first] = true;
+        }
+      }
+    }
+
     const Fields::value_type* r = nullptr;
     for (const auto& c : t0->constraints()) {
       auto f = this->fields.find(c);
-      if (f != this->fields.end() && (r == nullptr || f->second.first < r->second.first) && (t1 == t0 || hasConstraint(c, t1))) {
+      if (f != this->fields.end() && (r == nullptr || f->second.first < r->second.first) && (t1 == t0 || inT1[f->second.first])) {
         r = &*f;
       }
     }
@@ -159,7 +185,7 @@ struct RewriteFnAccess : public switchExprTyFn {
           if (const auto* fd = fieldFor(ap->type(), f->type())) {
             ExprPtr r(new Proj(switchOf(ap->args()[0], *this), fd->second.second, ap->la()));
             r->type(ap->type());
-            return this->hfe.unqualify(this->tenv, fd->first, r, this->ds);
+            return rewritten(fd->first, r);
           }
         }
       }
@@ -179,7 +205,7 @@ struct RewriteFnAccess : public switchExprTyFn {
 
         ExprPtr rv = fn(vn, p, v->la());
         rv->type(v->type());
-        return this->hfe.unqualify(this->tenv, fd->first, rv, this->ds);
+        return rewritten(fd->first, rv);
       }
     }
     return wrapWithTy(v->type(), new Var(v->value(), v->la()));
@@ -192,7 +218,7 @@ ExprPtr FieldVerifier::unqualify(const TEnvPtr& tenv, const ConstraintPtr& cst, 
     for (const auto& hfe : this->eliminators) {
       try {
         if (hfe->satisfied(tenv, hf, ds)) {
-          RewriteFnAccess rewrite(*hfe, tenv, ds);
+          RewriteFnAccess rewrite(*hfe, tenv, ds, hfe != this->records);
           rewrite.add(cst, hf);
           return hfe->unqualify(tenv, cst, switchOf(e, rewrite), ds);
         }
@@ -217,7 +243,7 @@ bool FieldVerifier::batchable(const TEnvPtr& tenv, const ConstraintPtr& cst, Def
 ExprPtr FieldVerifier::unqualifyBatch(const TEnvPtr& tenv, const Constraints& csts, const ExprPtr& e, Definitions* ds) const {
   // (an error here is reported as it is: to catch it and go back to one constraint at a
   //  time would hide it, and bring back the cost that batching is here to avoid)
-  RewriteFnAccess rewrite(*this->records, tenv, ds);
+  RewriteFnAccess rewrite(*this->records, tenv, ds, false);
   for (const auto& cst : csts) {
     HasField hf;
     if (!dec(cst, &hf)) {

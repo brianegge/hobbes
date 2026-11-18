@@ -7,8 +7,8 @@
 #include <hobbes/lang/preds/hasctor/variant.H>
 
 #include <memory>
-#include <set>
 #include <unordered_map>
+#include <vector>
 
 namespace hobbes {
 
@@ -80,23 +80,20 @@ struct RewriteMSelect : public switchExprTyFn {
     std::string ctor;
   };
   using Ctors = std::unordered_map<ConstraintPtr, Ctor, ConstraintHash, ConstraintEq>;
-  using CtorsPtr = std::shared_ptr<Ctors>;
+  Ctors ctors;
 
-  CtorsPtr         ctors;
-  std::set<size_t> decided; // the constraints (by place) that decided the uses that this is inside the arguments of
-
-  RewriteMSelect() : ctors(std::make_shared<Ctors>()) {
-  }
-  RewriteMSelect(const RewriteMSelect& outer, const Ctor& by) : ctors(outer.ctors), decided(outer.decided) {
-    this->decided.insert(by.order);
-  }
+  // the constraints (by place) that decided the uses whose arguments are being rewritten
+  // (marked on the way into an argument and cleared on the way out, rather than copied for each)
+  mutable std::vector<bool> decided;
+  mutable size_t            decidedCount = 0;
 
   void add(const HasCtor& hc, const ConstraintPtr& cst) {
     const TString* fn = is<TString>(hc.ctorlbl);
     if (fn == nullptr) { throw std::runtime_error("Internal error, invalid hasctor constraint for unqualification"); }
 
     // (a repeated constraint keeps its first place)
-    this->ctors->insert(std::make_pair(cst, Ctor{this->ctors->size(), hc, fn->value()}));
+    this->ctors.insert(std::make_pair(cst, Ctor{this->ctors.size(), hc, fn->value()}));
+    this->decided.resize(this->ctors.size(), false);
   }
 
   // the first of these constraints that a type states, if any
@@ -107,8 +104,8 @@ struct RewriteMSelect : public switchExprTyFn {
   const Ctor* ctorFor(const QualTypePtr& t) const {
     const Ctor* r = nullptr;
     for (const auto& c : t->constraints()) {
-      auto ct = this->ctors->find(c);
-      if (ct != this->ctors->end() && (r == nullptr || ct->second.order < r->order) && this->decided.count(ct->second.order) == 0) {
+      auto ct = this->ctors.find(c);
+      if (ct != this->ctors.end() && (r == nullptr || ct->second.order < r->order) && !this->decided[ct->second.order]) {
         r = &ct->second;
       }
     }
@@ -120,9 +117,22 @@ struct RewriteMSelect : public switchExprTyFn {
       if (const Var* f = is<Var>(stripAssumpHead(ap->fn()))) {
         if (f->value() == MSELECT_CTOR_FN) {
           if (const Ctor* ct = ctorFor(ap->type())) {
-            RewriteMSelect inArg(*this, *ct);
-            const ExprPtr& arg = ap->args()[0];
-            ExprPtr r(new Case(inArg.decided.size() == this->ctors->size() ? arg : switchOf(arg, inArg), list(Case::Binding(ct->ctor, ".p", justE(var(".p", ct->hc.ctorty, ap->la()), ap->la()))), nothingE(ct->hc.ctorty, ap->la()), ap->la()));
+            ExprPtr arg = ap->args()[0];
+            if (this->decidedCount + 1 < this->ctors.size()) {
+              // (a constraint that is decided is not chosen again until it is cleared here)
+              this->decided[ct->order] = true;
+              ++this->decidedCount;
+              try {
+                arg = switchOf(arg, *this);
+              } catch (...) {
+                this->decided[ct->order] = false;
+                --this->decidedCount;
+                throw;
+              }
+              this->decided[ct->order] = false;
+              --this->decidedCount;
+            }
+            ExprPtr r(new Case(arg, list(Case::Binding(ct->ctor, ".p", justE(var(".p", ct->hc.ctorty, ap->la()), ap->la()))), nothingE(ct->hc.ctorty, ap->la()), ap->la()));
             r->type(qualtype(maybety(ct->hc.ctorty)));
             return r;
           }
